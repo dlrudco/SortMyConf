@@ -6,6 +6,9 @@ import requests
 
 from errors import *
 
+import datetime
+import bibtexparser
+
 ERROR_KW = ['your computer or network may be sending automated queries']
 ROBOT_KW = ['unusual traffic from your computer network', 'not a robot', '로봇']
 EMPTY_KW = ["정보가 없습니다", "no information is available"]
@@ -17,7 +20,7 @@ def get_element(driver, xpath, attempts=5, _count=0):
         return element
     except Exception as e:
         if _count<attempts:
-            sleep(1)
+            time.sleep(1)
             get_element(driver, xpath, attempts=attempts, _count=_count+1)
         else:
             print("Element not found")
@@ -84,35 +87,44 @@ def get_cvpr(year):
     CVPR papers parser.
     This gathers a list of titles, authors, links for CVPR papers at the CVF foundation site.
     '''
-
-    if year < 2013 or year > 2020:
+    this_year = datetime.datetime.now().year
+    if year < 2013 or year > this_year:
         # There are CVPR events happened prior to 2013. However, the CVF site only supports those since 2013.
         # TODO: Support CVPR < 2013.
-        raise ValueError("Year must be in [2013, ..., 2020] for CVPR.")
-    
+        raise ValueError(f"Year must be in [2013, ..., {this_year}] for CVPR.")
+    # breakpoint()
     session = requests.Session()
-    page = session.get("https://openaccess.thecvf.com/CVPR{}.py".format(year))
+    page = session.get("https://openaccess.thecvf.com/CVPR{}?day=all".format(year))
     soup = BeautifulSoup(page.content, 'html.parser')
-
-    link_psoup = soup.select("dt.ptitle") # Soup containing titles and links
-    cit_psoup = soup.select("div.bibref") # Soup containing authors
-    if len(link_psoup) == 0:
-        # Some CVPR proceedings are organized by its poster date.
-        # The following loop iterates thorough each day.
-        for date_soup in soup.select("dd"):
-            href = date_soup.select_one("a").get("href")
-            page = session.get("https://openaccess.thecvf.com/{}".format(href))
-            soup = BeautifulSoup(page.content, 'html.parser')
-
-            link_psoup += soup.select("dt.ptitle")
-            cit_psoup += soup.select("div.bibref")
-
-    pattern = "author = {(.*?)},\ntitle"
-    authors = [re.search(pattern, paper_.text).group(1) for paper_ in cit_psoup]
-    titles = [paper_.select_one("a").text for paper_ in link_psoup]
-    links = ["https://openaccess.thecvf.com/{}".format(paper_.select_one("a").get("href")) for paper_ in link_psoup]
-
-    return authors, titles, links
+    # breakpoint()
+    links = soup.select('div.link2')
+    pdf_links = []
+    titles = []
+    authors = []
+    for link in links:
+        # authors and title are in the child <div> tag 
+        # ex :        
+        '''
+        <div class="link2">[<a class="fakelink" onclick="$(this).siblings('.bibref').slideToggle()">bibtex</a>]
+        <div class="bibref pre-white-space">@InProceedings{Zhu_2022_CVPR,
+            author    = {Zhu, Haowei and Ke, Wenjing and Li, Dong and Liu, Ji and Tian, Lu and Shan, Yi},
+            title     = {Dual Cross-Attention Learning for Fine-Grained Visual Categorization and Object Re-Identification},
+            booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+            month     = {June},
+            year      = {2022},
+            pages     = {4692-4702}
+        }</div>
+        </div>
+        '''
+        bibref = link.find('div', class_='bibref')
+        # get the author from the bibref
+        information = bibtexparser.parse_string(bibref.text).entries[0]
+        authors.append(information['author'])
+        titles.append(information['title'])
+        # get parent of link
+        parent = link.parent
+        pdf_links.append(parent.find('a').get('href'))
+    return authors, titles, pdf_links
 
 def get_iccv(year):
     '''
