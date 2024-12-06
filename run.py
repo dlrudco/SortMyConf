@@ -8,6 +8,11 @@ from tqdm import tqdm
 from errors import *
 from contents import get_gscholar_contents, get_citations, get_papers_list
 
+# from habanero import Crossref
+import requests
+from multiprocessing import Pool, get_context, Manager
+import json
+cpu_count = os.cpu_count()
 # Solve conflict between raw_input and input on Python 2 and Python 3
 if sys.version[0]=="3": raw_input=input
 
@@ -88,33 +93,6 @@ def query_yes_no(question, default="yes"):
             sys.stdout.write("Please respond with 'yes' or 'no' "
                              "(or 'y' or 'n').\n")
 
-def setup_driver():
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.common.exceptions import StaleElementReferenceException
-        import chromedriver_autoinstaller
-        chromedriver_autoinstaller.install()
-
-    except Exception as e:
-        print(e)
-        print("Please install selenium and chromedriver_autoinstaller.")
-
-    print('Loading...')
-    chrome_options = Options()
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-notifications")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-    chrome_options.add_argument("window-size=1280,800")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36")
-
-    driver = webdriver.Chrome(chrome_options=chrome_options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-    return driver
-
 
 def save_checkpoint(conference, year, authors, titles, links, idx, citations, etc):
     if idx != 0:
@@ -134,6 +112,95 @@ def restore_checkpoint():
     
     return data['conference'], data['year'], data['authors'], data['titles'], data['links'], data['idx'], data['citations'], data['etc']
 
+def get_doi(title):
+    url = 'https://api.crossref.org/works'
+    params = {'query.title': title, 'rows': 1, 'query.bibliographic': title}
+    response = requests.get(url, params=params)
+    try:
+        response.raise_for_status()
+        data = response.json()
+        # breakpoint()
+        if data['message']['total-results'] == 0:
+            return None
+        else:
+            return data['message']['items'][0]['DOI']
+    except requests.exceptions.HTTPError as e:
+        print(f"DOI Error: {e}, {title}")
+        return None
+    # breakpoint()
+    # for using semanticscholar, we need to first query the paper title to get the paperid
+    # with the paper id, we query again to get the doi
+    # url = 'https://api.semanticscholar.org/graph/v1/paper/search/match?query=' + title
+    # params = {'limit': 1, 'fields': 'title'}
+    # response = requests.get(url, params=params)
+    # while True:
+    #     try:
+    #         # if the error is 429, we wait for 1 second and try again
+    #         response.raise_for_status()
+    #         data = response.json()
+    #     except requests.exceptions.HTTPError as e:
+    #         if response.status_code == 429:
+    #             print("Too many requests. Waiting for 1 second.")
+    #             sleep(1)
+    #             response = requests.get(url, params=params)
+    #             continue
+    #         else:
+    #             break
+    # if len(data['data']) == 0:
+    #     print(f"Title not found: {title}")
+    #     return None
+    # url = 'https://api.semanticscholar.org/graph/v1/paper/' + data['data'][0]['paperId']
+    # params = {'fields': 'externalIds'}
+    # response = requests.get(url, params=params)
+    # while True:
+    #     try:
+    #         response.raise_for_status()
+    #         doi_data = response.json()
+    #         if 'DOI' not in doi_data['externalIds']:
+    #             print(f"DOI not found for {title}")
+    #             return None
+    #         return doi_data['externalIds']['DOI']
+    #     except requests.exceptions.HTTPError as e:
+    #         if response.status_code == 429:
+    #             print("Too many requests. Waiting for 1 second.")
+    #             sleep(1)
+    #             response = requests.get(url, params=params)
+    #             continue
+    #         else:
+    #             return None
+    
+def get_count(title):
+    url = 'https://api.crossref.org/works'
+    params = {'query.title': title, 'rows': 1, 'query.bibliographic': title}
+    response = requests.get(url, params=params)
+    try:
+        response.raise_for_status()
+        data = response.json()
+        # breakpoint()
+        if data['message']['total-results'] == 0:
+            return title, -1
+        else:
+            return title, data['message']['items'][0].get('is-referenced-by-count', -1)
+    except requests.exceptions.HTTPError as e:
+        print(f"DOI Error: {e}, {title}")
+        return title, -1
+    
+def get_citation_count(doi):
+    url = f'https://opencitations.net/index/api/v2/citation-count/doi:{doi}'
+    headers = {'Accept': 'application/json', "authorization": '017f75ef-751f-4eee-8002-52773db6bc36'}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+    return data[0]['count']
+
+def get_citations_from_title(title):
+    
+    doi = get_doi(title)
+    if doi is None:
+        print(f"DOI not found for {title }")
+        return title, -1
+    return title,get_citation_count(doi)
+
 def main():
     GSCHOLAR_URL = "https://scholar.google.com/scholar?hl=en&as_sdt=0%2C5&q={}&num=1"
     
@@ -147,112 +214,36 @@ def main():
     start_idx = 0
     citations = []
     etc = []
-
-    restored = False
-    if os.path.isfile('./temp/backup.pkl'):
-        conf_, year_, authors, titles, links, start_idx_, citations_, etc_ = restore_checkpoint()
-
-        if conference == conf_ and year == year_:
-            restored = query_yes_no("Restore from backup? {} {} {}/{} papers done.".format(conf_, year_, start_idx_, len(authors)))
-
-    if restored:
-        start_idx = start_idx_
-        citations = citations_
-        etc = etc_
-
-    else:
-        print("Loading {} {} results".format(conference, year))
-        authors, titles, links = get_papers_list(conference, year)
-        print("Found {:d} papers.".format(len(authors)))
-
-    driver = setup_driver() # Load chrome driver
-    for idx in tqdm(range(start_idx, len(authors)), total=len(authors), initial=start_idx):
-        title = titles[idx]
-        link = links[idx]
-
-        query = link.replace("https://doi.org/", "").replace(':', '%3A').replace('/', '%2F')
-        url = GSCHOLAR_URL.format(query)
-        driver.get(url)
-
-        while(len(citations) != idx+1):
-            """
-            While Loop 작동 매커니즘
-
-            구글 스콜라 검색 결과를 읽어와서 다음 예외 상황에 대처
-      
-            Case (1) 캡차 풀기 요구 받은 경우
-            유저가 직접 캡차를 풀고, 터미널에 엔터를 입력해주면 계속 진행.
-
-            Case (2) Auto Query 감지에 걸린 경우
-            이 경우는 구글 국가를 변경하는 방법 외에는 Bypass 불가능.
-            .com -> .co.kr -> .co.uk -> .ca 순으로 변경.
-            .ca 까지 모두 소진한 경우 프로그램 종료 (프로그램 다시 시작하면 됨).
-
-            Case (3) 검색 결과가 없음
-            논문 Repo 링크 대신 논문 제목으로 재검색.
-            재검색에도 결과 없으면 Citation 0개로 처리 및 "etc" 열에 에러 로그 추가.
-
-            Case (4) 알 수 없는 에러
-            Python debugger 실행.
-            """
-
-            try:
-                # Try getting gscholar search results.
-                gs_content = get_gscholar_contents(driver)
-                citations.append(get_citations(str(gs_content.format_string)))
-                etc.append("")
-
-            except RobotError:
-                # You must solve captcha. Case (1).
-                save_checkpoint(conference, year, authors, titles, links, idx, citations, etc)
-                raw_input("Solve captcha manually and press enter here to continue...")
-
-            except AQError:
-                # Replace the google url with one for other counturies. Case (2).
-                save_checkpoint(conference, year, authors, titles, links, idx, citations, etc)
-                if '.com' in GSCHOLAR_URL:
-                    GSCHOLAR_URL = GSCHOLAR_URL.replace('.com', '.co.kr')
-
-                elif '.co.kr' in GSCHOLAR_URL:
-                    GSCHOLAR_URL = GSCHOLAR_URL.replace('.co.kr', '.co.uk')
-
-                elif '.co.uk' in GSCHOLAR_URL:
-                    GSCHOLAR_URL = GSCHOLAR_URL.replace('.co.kr', '.ca')
-                
-                else:
-                    raise GScholarError()
-                
-                url = GSCHOLAR_URL.format(query)
-                driver.get(url)
-                
-            except SearchError:
-                # No Search Results. Case (3).
-                new_query = "\""+title.replace(' ', '+')+"\""
-                if query != new_query:
-                    print("Warning: No search result with link for \"{}\"".format(title))
-                    print("Retrying Search with the title...")
-                    query = new_query
-                    url = GSCHOLAR_URL.format(query)
-                    driver.get(url)
-
-                else:
-                    print("Error: No search result for \"{}\"".format(title))
-                    citations.append(0)
-                    etc.append("No Search Results")
-            
-            except Exception as e:
-                # Unknown Error. Case (4).
-                print("Error: No success.")
-                print(e)
-                import pdb; pdb.set_trace()
-                a=1
+    print("Loading {} {} results".format(conference, year))
+    authors, titles, links = get_papers_list(conference, year)
+    print("Found {:d} papers.".format(len(authors)))
+    assert len(authors) == len(titles) == len(links) != 0, f"No {conference} papers found in year {year}."
     
-        if idx+1 == len(titles):
-            save_checkpoint(conference, year, authors, titles, links, idx+1, citations, etc)
-
-        # Delay
-        sleep(0.5)
-
+    if os.path.exists(f'./temp/{conference}_{year}_completed.json'):
+        information_dict = json.load(open(f'./temp/{conference}_{year}_completed.json'))
+    else:
+        information_dict = {title :{'authors' : author , 'link' : link} for title, author, link in zip(titles, authors, links)}
+    not_processed = [title for title in titles if 'citations' not in information_dict[title].keys()]
+    print(f"Skipping already done {len(titles) - len(not_processed)} papers of total {len(titles)} papers.")
+    p = get_context("spawn").Pool(5)
+    with tqdm(range(start_idx, len(not_processed))) as pbar:
+        for cit in p.imap_unordered(get_count, not_processed):
+            information_dict[cit[0]]['citations'] = cit[1]
+            information_dict[cit[0]]['etc'] = ''
+            pbar.update()
+            # for every 100 papers, save the progress
+            if pbar.n % 100 == 0:
+                try:
+                    json.dump(information_dict, open(f'./temp/{conference}_{year}_completed.json', 'w'))
+                except TypeError:
+                    breakpoint()
+    p.close()
+    p.join()
+    
+    authors = [information_dict[title]['authors'] for title in titles]
+    links = [information_dict[title]['link'] for title in titles]
+    citations = [-1 if 'citations' not in information_dict[title].keys() else int(information_dict[title]['citations']) for title in titles]
+    etc = ['' if 'etc' not in information_dict[title].keys() else information_dict[title]['etc'] for title in titles]
     # Create a dataset and sort by the number of citations
     data = pd.DataFrame(list(zip(authors, titles, citations, links, etc)), index = [i+1 for i in range(len(authors))],
                         columns=['Author', 'Title', 'Citations', 'Source', 'Etc'])
